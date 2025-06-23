@@ -112,9 +112,21 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
     xy_table_data_ = new float[xy_table_data_size_];
   }
   is_camera_node_initialized_ = true;
+   if (cudaMallocManaged(&d_x, MAX_POINTS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_y, MAX_POINTS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_z, MAX_POINTS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_ranges, LASER_STEPS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_matrix, 16 * sizeof(float)) == cudaSuccess) {
+    
+    cuda_initialized = true;
+    
+  } else {
+    RCLCPP_ERROR_STREAM(logger_, "CUDA allocation failed - disabling laser scan");
+    cuda_initialized = false;
+    enable_laser_scan_ = false;
+  }
 
-  
-  computeTransformationMatrix(urdf_x_, urdf_y_, urdf_z_, urdf_roll_, urdf_pitch_, urdf_yaw_, transform_matrix);
+  computeTransformationMatrix(urdf_x_, urdf_y_, urdf_z_, urdf_roll_, urdf_pitch_, urdf_yaw_, d_matrix);
 
 }
 
@@ -183,6 +195,14 @@ void OBCameraNode::clean() noexcept {
   if (xy_table_data_) {
     delete[] xy_table_data_;
     xy_table_data_ = nullptr;
+  }
+  if (cuda_initialized) {
+    if (d_x) cudaFree(d_x);
+    if (d_y) cudaFree(d_y);
+    if (d_z) cudaFree(d_z);
+    if (d_ranges) cudaFree(d_ranges);
+    if (d_matrix) cudaFree(d_matrix);
+    cuda_initialized = false;
   }
   RCLCPP_WARN_STREAM(logger_, "Destroy ~OBCameraNode DONE");
 }
@@ -1276,6 +1296,9 @@ void OBCameraNode::getParameters() {
   setAndGetNodeParameter<double>(urdf_pitch_, "urdf_pith", 0.0);
   setAndGetNodeParameter<double>(urdf_yaw_, "urdf_yaw", 0.0);
 
+  setAndGetNodeParameter(enable_laser_scan_, "enable_laser_scan", false);
+  setAndGetNodeParameter<std::string>(laser_scan_frame_id_, "laser_scan_frame_id", camera_name_ + "_laser");
+
   setAndGetNodeParameter<std::string>(time_domain_, "time_domain", "device");
   auto device_info = device_->getDeviceInfo();
   CHECK_NOTNULL(device_info.get());
@@ -1423,6 +1446,10 @@ void OBCameraNode::setupPublishers() {
         "depth/points", rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(point_cloud_qos_profile),
                                     point_cloud_qos_profile));
   }
+
+  if (enable_laser_scan_) {
+    laser_scan_pub_ = node_->create_publisher<sensor_msgs::msg::LaserScan>("scan", 10);
+  }
   auto device_info = device_->getDeviceInfo();
   CHECK_NOTNULL(device_info.get());
   auto pid = device_info->pid();
@@ -1567,6 +1594,26 @@ void OBCameraNode::publishPointCloud(const std::shared_ptr<ob::FrameSet> &frame_
   }
 }
 
+float OBCameraNode::getCameraHorizontalFOV() {
+  try {
+    auto camera_params = pipeline_->getCameraParam();
+    auto intrinsic = camera_params.depthIntrinsic;
+    
+    // Calculate horizontal FOV from intrinsics
+    float fx = intrinsic.fx;  // Focal length X
+    float width = intrinsic.width;  // Image width
+    
+    // FOV = 2 * atan(width / (2 * fx))
+    float fov_radians = 2.0f * atan(width / (2.0f * fx));
+    
+    RCLCPP_INFO_STREAM(logger_, "Camera horizontal FOV: " << (fov_radians * 180.0f / 3.14159f) << " degrees");
+    return fov_radians;
+    
+  } catch (...) {
+    RCLCPP_WARN_STREAM(logger_, "Could not get camera FOV, using default 60°");
+    return 1.0472f; // Default 60 degrees
+  }
+}
 
 void OBCameraNode::computeTransformationMatrix(float x, float y, float z,
                                  float roll, float pitch, float yaw,
@@ -1606,8 +1653,8 @@ void OBCameraNode::computeTransformationMatrix(float x, float y, float z,
 
 
 void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {
-  (void)frame_set;
-  if (!depth_cloud_pub_ || depth_cloud_pub_->get_subscription_count() == 0 ||
+  if (((!depth_cloud_pub_ || depth_cloud_pub_->get_subscription_count() == 0) &&
+       (!enable_laser_scan_ || !laser_scan_pub_ || laser_scan_pub_->get_subscription_count() == 0)) ||
       !enable_point_cloud_ || !depth_frame_) {
     return;
   }
@@ -1616,11 +1663,13 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     RCLCPP_ERROR_STREAM(logger_, "depth frame is null");
     return;
   }
+  
   auto depth_frame = depth_frame_->as<ob::DepthFrame>();
   if (!depth_frame) {
     RCLCPP_ERROR_STREAM(logger_, "depth frame is null");
     return;
   }
+  
   CHECK_NOTNULL(pipeline_);
   auto camera_params = pipeline_->getCameraParam();
   auto device_info = device_->getDeviceInfo();
@@ -1629,6 +1678,7 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
   if (depth_registration_ || pid == DABAI_MAX_PID) {
     camera_params.depthIntrinsic = camera_params.rgbIntrinsic;
   }
+  
   depth_point_cloud_filter_.setCameraParam(camera_params);
   float depth_scale = depth_frame->getValueScale();
   depth_point_cloud_filter_.setPositionDataScaled(depth_scale);
@@ -1638,84 +1688,11 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     RCLCPP_ERROR_STREAM(logger_, "Failed to process depth frame");
     return;
   }
+  
   auto point_size = result_frame->dataSize() / sizeof(OBPoint);
   auto *points = static_cast<OBPoint *>(result_frame->data());
+  
 
-  // start Mizdan
-
-size_t N = 1'000'000;
-// Allocate laser scan buffer
-const int num_steps = 360;
-const int num_max_scans = 16;
-const float min_height = -1.0f;
-const float max_height = 3.0f;
-const float min_range = 0.1f;
-const float max_range = 100.0f;
-const float min_angle = -3.14159f;
-const float max_angle = 3.14159f;
-const float angle_increment = (max_angle - min_angle) / num_steps;
-const float height_increment = (max_height - min_height) / num_max_scans;
-
-        
-if (!alocat) {
-// Allocate UMA memory
-cudaMallocManaged(&d_x, N * sizeof(float));
-cudaMallocManaged(&d_y, N * sizeof(float));
-cudaMallocManaged(&d_z, N * sizeof(float));
-cudaMallocManaged(&d_ranges, 2* num_steps * num_max_scans * sizeof(float));
-// Initialize ranges to NaN
-for (int i = 0; i < num_steps * num_max_scans; ++i)
-{
-    d_ranges[i] = std::numeric_limits<float>::quiet_NaN();
-}
-alocat = true;
-}
-
-// Initialize
-for (size_t i = 0; i < N; ++i)
-{
-    d_x[i] = static_cast<float>(i);
-    d_y[i] = static_cast<float>(i) * 2.0f;
-    d_z[i] = static_cast<float>(i) * 3.0f;
-}
-
-
-float* d_matrix;
-cudaMallocManaged(&d_matrix, 16 * sizeof(float));
-memcpy(d_matrix, transform_matrix, 16 * sizeof(float));
-
-// Call kernel
-launch_transform_kernel_matrix(d_x, d_y, d_z, N, d_matrix);
-
-
-// Call after transform kernel:
-launch_pointcloud_to_laserscan_kernel(
-    d_x, d_y, d_z, N,
-    d_ranges,  // output: cudaMallocManaged(&d_ranges, num_steps * num_max_scans * sizeof(float));
-    min_height, height_increment,
-    num_steps,
-    min_range, max_range,
-    min_angle, max_angle,
-    angle_increment);
-
-
-// Print first point
-RCLCPP_INFO(logger_, "First point: (%f, %f, %f)", d_x[0], d_y[0], d_z[0]);
-
-// Free
-// if (!alocat) {
-// cudaFree(d_x);
-// cudaFree(d_y);
-// cudaFree(d_z);
-// cudaFree(d_matrix);
-// alocat = true;
-// }
-
-    
-
-  RCLCPP_ERROR_STREAM(logger_, "xxxxxxxxxxxxxxxxxxx");
-
-  // end mizdan
 
   auto width = depth_frame->width();
   auto height = depth_frame->height();
@@ -1781,6 +1758,94 @@ RCLCPP_INFO(logger_, "First point: (%f, %f, %f)", d_x[0], d_y[0], d_z[0]);
     }
   }
   depth_cloud_pub_->publish(std::move(point_cloud_msg));
+
+
+
+
+  if (enable_laser_scan_ && laser_scan_pub_ && laser_scan_pub_->get_subscription_count() > 0) {
+   size_t valid_count = 0;
+  size_t skip_step = std::max(1UL, point_size / MAX_POINTS);
+  
+  for (size_t i = 0; i < point_size && valid_count < MAX_POINTS; i += skip_step) {
+    if (!isnan(points[i].x) && !isnan(points[i].y) && !isnan(points[i].z) &&
+        points[i].x != 0 && points[i].y != 0 && points[i].z != 0) {
+      d_x[valid_count] = points[i].x / 1000.0f;  // mm → meters
+      d_y[valid_count] = points[i].y / 1000.0f;  // mm → meters  
+      d_z[valid_count] = points[i].z / 1000.0f;  // mm → meters
+      valid_count++;
+    }
+  }
+
+  if (valid_count > 30) {
+    // Set transformation matrix (once per frame)
+    auto frame_timestamp = getFrameTimestampUs(depth_frame);
+    auto timestamp = fromUsToROSTime(frame_timestamp);
+    computeTransformationMatrix(urdf_x_, urdf_y_, urdf_z_, urdf_roll_, urdf_pitch_, urdf_yaw_, d_matrix);
+    
+    const float min_range = 0.1f, max_range = 30.0f;
+    
+    const float min_height = -1.0f;    // meters
+    const float max_height = 3.0f;     // meters
+    const float height_increment = (max_height - min_height) / 6.0f;  
+   
+    float camera_fov = getCameraHorizontalFOV();
+    const float min_angle = -camera_fov / 2.0f;
+    const float max_angle = camera_fov / 2.0f;
+    
+    // const float angle_increment = camera_fov / LASER_STEPS;
+    const float angle_increment = 0.05;
+    LASER_STEPS = camera_fov / angle_increment;
+
+    // Transform points
+    // launch_transform_kernel_matrix(d_x, d_y, d_z, valid_count, d_matrix);
+    for (int i = 0; i < LASER_STEPS; ++i) {
+      d_ranges[i] = std::numeric_limits<float>::quiet_NaN();
+    }
+    
+
+    launch_pointcloud_to_laserscan_kernel(
+        d_x, d_y, d_z, valid_count,     // Point cloud data
+        d_ranges,                       // Output ranges array
+        min_height,                     // Height filtering
+        height_increment,               // Height layer spacing
+        LASER_STEPS,                    // Number of angular steps
+        min_range, max_range,           // Range limits
+        min_angle, max_angle,           // Angular limits
+        angle_increment                 // Angular resolution
+    );
+    RCLCPP_INFO_STREAM(logger_, "Laser scan published");
+    // Publish laser scan
+    auto scan_msg = sensor_msgs::msg::LaserScan();
+    scan_msg.header.stamp = timestamp;
+    scan_msg.header.frame_id = frame_id;
+    scan_msg.angle_min = min_angle;
+    scan_msg.angle_max = max_angle;
+    scan_msg.angle_increment = angle_increment;
+    scan_msg.range_min = min_range;
+    scan_msg.range_max = max_range;
+    scan_msg.scan_time = 0.067f;  // ~15 fps
+    scan_msg.time_increment = scan_msg.scan_time / LASER_STEPS;
+    
+    // Extract ranges from first height layer (since HEIGHT_LAYERS = 1)
+    scan_msg.ranges.resize(LASER_STEPS);
+    scan_msg.intensities.resize(LASER_STEPS, 0.0f);
+    
+    for (int i = 0; i < LASER_STEPS; ++i) {
+      
+      scan_msg.ranges[i] = d_ranges[i];
+    }
+    
+    laser_scan_pub_->publish(scan_msg);
+  
+  }
+  }
+
+  // end mizdan
+
+
+
+
+
 }
 
 void OBCameraNode::publishColoredPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {

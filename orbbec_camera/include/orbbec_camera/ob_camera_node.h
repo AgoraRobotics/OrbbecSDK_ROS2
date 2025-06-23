@@ -63,6 +63,7 @@
 #include "orbbec_camera/image_publisher.h"
 #include "jpeg_decoder.h"
 #include <std_msgs/msg/string.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 
 #if __has_include(<cv_bridge/cv_bridge.hpp>)
 #include <cv_bridge/cv_bridge.hpp>
@@ -154,12 +155,19 @@ class OBCameraNode {
   bool alocat = false;
 
 
-float* d_x;
-float* d_y;
-float* d_z;
-float* d_ranges;
+float* d_x = nullptr;
+float* d_y = nullptr; 
+float* d_z = nullptr;
+float* d_ranges = nullptr;
+float* d_matrix = nullptr;
+bool cuda_initialized = false;
 
-float transform_matrix[16];
+static constexpr size_t MAX_POINTS = 1000000;  // Adjustable
+int LASER_STEPS = 360;
+
+rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laser_scan_pub_;
+bool enable_laser_scan_ = false;
+std::string laser_scan_frame_id_;
 
  private:
   struct IMUData {
@@ -195,6 +203,8 @@ float transform_matrix[16];
   void setupCameraCtrlServices();
 
   void stopStreams();
+
+  float getCameraHorizontalFOV();
 
   void stopIMU();
 

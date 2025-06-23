@@ -40,10 +40,6 @@ void pointcloud_to_laserscan_kernel(
         float yi = y[idx];
         float zi = z[idx];
 
-        int jndex = (zi - min_height) / height_increment;
-        if (jndex < 0 || jndex>5) // aici e  numarul de felii - il vom hardcoda pe 1
-            return;
-
         const float range = hypotf(xi, yi);
         if (range < min_range || range > max_range)
             return;
@@ -56,14 +52,10 @@ void pointcloud_to_laserscan_kernel(
         if (index < 0 || index >= num_steps)
             return;
 
-        const int out_index = num_steps * jndex + index;
-        if (out_index < 0)
-            return;
-
-        float old_range = ranges[out_index];
+        float old_range = ranges[index];
         if (isnan(old_range) || range < old_range)
         {
-            atomicExch(ranges + out_index, range);
+            atomicExch(ranges + index, range);
         }
     }
 }

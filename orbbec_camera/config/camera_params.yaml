@@ -1,6 +1,6 @@
 # common params
 depth_registration: false
-enable_point_cloud: false
+enable_point_cloud: true
 enable_colored_point_cloud: false
 device_preset: "High Accuracy"
 laser_on_off_mode: 1 # 0: off, 1: on-off, 1: off-on
@@ -23,6 +23,7 @@ color_format: "YUYV"
 enable_color_auto_exposure: false
 color_exposure: 50 # 5ms
 color_gain: -1 # -1 default
+enable_laser_scan: true
 
 # depth params
 depth_width: 640
