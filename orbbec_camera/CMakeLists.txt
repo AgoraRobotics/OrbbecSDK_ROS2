@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.8)
 project(orbbec_camera)
 
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC -O3")
@@ -9,11 +10,11 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -O3")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fPIC -g3")
 set(CMAKE_BUILD_TYPE "Release")
 option(USE_RK_HW_DECODER "Use Rockchip hardware decoder" OFF)
-option(USE_NV_HW_DECODER "Use Nvidia hardware decoder" OFF)
+option(USE_NV_HW_DECODER "Use Nvidia hardware decoder" ON)
 
 
 if (CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Werror -Wno-pedantic -Wno-array-bounds)
+  add_compile_options(-Wall -Wextra -Werror -Wno-pedantic -Wno-array-bounds -Wno-unknown-pragmas -Wno-sign-compare)
 endif ()
 
 # find dependencies
@@ -51,6 +52,11 @@ endforeach ()
 
 find_package(PkgConfig REQUIRED)
 
+find_package(CUDA REQUIRED)
+# Force use shared cudart
+# set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
+
+include_directories(${CUDA_INCLUDE_DIRS})
 
 if (USE_RK_HW_DECODER)
   pkg_search_module(RK_MPP REQUIRED rockchip_mpp)
@@ -107,6 +113,8 @@ set(COMMON_INCLUDE_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/tools
 )
 
+link_directories(/home/nano/cupoch/build/lib)
+
 set(COMMON_LIBRARIES
   ${ORBBEC_SDK_LIBRARIES}
   ${OpenCV_LIBS}
@@ -116,6 +124,11 @@ set(COMMON_LIBRARIES
   Threads::Threads
   -lrt
   -ldw
+  # cupoch_geometry
+  # cupoch_io
+  # cupoch_utility
+  # cupoch_knn
+  # flann_cuda_s
 )
 if (USE_RK_HW_DECODER)
   list(APPEND COMMON_LIBRARIES
@@ -142,6 +155,7 @@ set(SOURCE_FILES
   src/synced_imu_publisher.cpp
   src/utils.cpp
   src/jpeg_decoder.cpp
+  src/transform.cu
 )
 
 if (USE_RK_HW_DECODER)
@@ -185,20 +199,26 @@ if (USE_NV_HW_DECODER)
 endif ()
 
 macro(add_orbbec_executable TARGET SOURCE)
-  add_executable(${TARGET} ${SOURCE})
+  cuda_add_executable(${TARGET} ${SOURCE})
   target_include_directories(${TARGET} PUBLIC ${COMMON_INCLUDE_DIRS})
   target_link_libraries(${TARGET} ${COMMON_LIBRARIES} ${PROJECT_NAME})
   ament_target_dependencies(${TARGET} ${dependencies})
 endmacro()
 
 # Define library and nodes
-add_library(${PROJECT_NAME} SHARED
+cuda_add_library(${PROJECT_NAME} SHARED
   ${SOURCE_FILES}
 )
 
+target_include_directories(${PROJECT_NAME}
+    PRIVATE
+    /home/nano/cupoch/src
+)
+
+
 ament_target_dependencies(${PROJECT_NAME} ${dependencies})
 target_include_directories(${PROJECT_NAME} PUBLIC ${COMMON_INCLUDE_DIRS})
-target_link_libraries(${PROJECT_NAME} ${COMMON_LIBRARIES})
+target_link_libraries(${PROJECT_NAME} ${COMMON_LIBRARIES} ${CUDA_LIBRARIES})
 
 
 rclcpp_components_register_node(${PROJECT_NAME}

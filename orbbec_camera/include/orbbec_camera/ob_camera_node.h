@@ -151,6 +151,15 @@ class OBCameraNode {
   void startIMUSyncStream();
 
   void startIMU();
+  bool alocat = false;
+
+
+float* d_x;
+float* d_y;
+float* d_z;
+float* d_ranges;
+
+float transform_matrix[16];
 
  private:
   struct IMUData {
@@ -342,6 +351,9 @@ class OBCameraNode {
   static bool isGemini335PID(uint32_t pid);
 
   void setupDepthPostProcessFilter();
+
+
+void computeTransformationMatrix(float urdf_x_,float  urdf_y_,float  urdf_z_,float  urdf_roll_,float  urdf_pitch_,float  urdf_yaw_,float* transform_matrix);
 
  private:
   rclcpp::Node* node_ = nullptr;
@@ -599,6 +611,14 @@ class OBCameraNode {
   int depth_ae_roi_top_ = -1;
   int depth_ae_roi_right_ = -1;
   int depth_ae_roi_bottom_ = -1;
+
+
+  double urdf_x_ = 0.0;
+  double urdf_y_ = 0.0;
+  double urdf_z_ = 0.0;
+  double urdf_roll_ = 0.0;
+  double urdf_pitch_ = 0.0;
+  double urdf_yaw_ = 0.0;
 
   std::string frame_aggregate_mode_ = "ANY";  // # full_frame、color_frame、ANY or disable
 };

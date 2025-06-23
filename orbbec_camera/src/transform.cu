@@ -1,0 +1,104 @@
+#include <cuda_runtime.h>
+
+__global__ void transform_kernel_matrix(
+    float* in_x, float* in_y, float* in_z,
+    const float* T,  // 16-element array: row-major 4x4 matrix
+    int num_points)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_points) {
+        float x = in_x[idx];
+        float y = in_y[idx];
+        float z = in_z[idx];
+
+        float out_x = T[0] * x + T[1] * y + T[2] * z + T[3];
+        float out_y = T[4] * x + T[5] * y + T[6] * z + T[7];
+        float out_z = T[8] * x + T[9] * y + T[10] * z + T[11];
+        atomicExch(in_x + idx, out_x);
+        atomicExch(in_y + idx, out_y);
+        atomicExch(in_z + idx, out_z);
+    }
+}
+
+
+
+
+__global__
+void pointcloud_to_laserscan_kernel(
+    const float* x, const float* y, const float* z, size_t N,
+    float* ranges,
+    float min_height, float height_increment,
+    int num_steps,
+    float min_range, float max_range,
+    float min_angle, float max_angle,
+    float angle_increment)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N)
+    {
+        float xi = x[idx];
+        float yi = y[idx];
+        float zi = z[idx];
+
+        int jndex = (zi - min_height) / height_increment;
+        if (jndex < 0 || jndex>5) // aici e  numarul de felii - il vom hardcoda pe 1
+            return;
+
+        const float range = hypotf(xi, yi);
+        if (range < min_range || range > max_range)
+            return;
+
+        const float angle = atan2f(yi, xi);
+        if (angle < min_angle || angle > max_angle)
+            return;
+
+        int index = (angle - min_angle) / angle_increment;
+        if (index < 0 || index >= num_steps)
+            return;
+
+        const int out_index = num_steps * jndex + index;
+        if (out_index < 0)
+            return;
+
+        float old_range = ranges[out_index];
+        if (isnan(old_range) || range < old_range)
+        {
+            atomicExch(ranges + out_index, range);
+        }
+    }
+}
+
+extern "C"
+void launch_transform_kernel_matrix(float* x, float* y, float* z, size_t N, const float* matrix)
+{
+    int blockSize = 256;
+    int numBlocks = (N + blockSize - 1) / blockSize;
+
+    transform_kernel_matrix<<<numBlocks, blockSize>>>(x, y, z, matrix, N);
+    cudaDeviceSynchronize();
+}
+
+extern "C"
+void launch_pointcloud_to_laserscan_kernel(
+    const float* x, const float* y, const float* z, size_t N,
+    float* ranges,
+    float min_height, float height_increment,
+    int num_steps,
+    float min_range, float max_range,
+    float min_angle, float max_angle,
+    float angle_increment)
+{
+    int blockSize = 256;
+    int numBlocks = (N + blockSize - 1) / blockSize;
+
+    pointcloud_to_laserscan_kernel<<<numBlocks, blockSize>>>(
+        x, y, z, N,
+        ranges,
+        min_height, height_increment,
+        num_steps,
+        min_range, max_range,
+        min_angle, max_angle,
+        angle_increment);
+
+    cudaDeviceSynchronize();
+}

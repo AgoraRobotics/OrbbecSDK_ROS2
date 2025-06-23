@@ -15,6 +15,7 @@
 *******************************************************************************/
 #if defined(USE_NV_HW_DECODER)
 #include "orbbec_camera/nvjpeg_decoder_manager.h"
+#include <rclcpp/rclcpp.hpp>
 #include <fstream>
 #include <sstream>
 

@@ -14,6 +14,8 @@
  * limitations under the License.
  *******************************************************************************/
 
+#include <cuda_runtime.h>
+
 #include "orbbec_camera/ob_camera_node.h"
 #include <rclcpp/rclcpp.hpp>
 #include <thread>
@@ -32,6 +34,19 @@
 #include "orbbec_camera/nvjpeg_decoder_manager.h"
 #endif
 
+extern "C"
+void launch_transform_kernel_matrix(float* x, float* y, float* z, size_t N, const float* matrix);
+
+extern "C"
+void launch_pointcloud_to_laserscan_kernel(
+    const float* x, const float* y, const float* z, size_t N,
+    float* ranges,
+    float min_height, float height_increment,
+    int num_steps,
+    float min_range, float max_range,
+    float min_angle, float max_angle,
+    float angle_increment);
+
 namespace orbbec_camera {
 using namespace std::chrono_literals;
 
@@ -42,6 +57,7 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
       parameters_(std::move(parameters)),
       logger_(node->get_logger()),
       use_intra_process_(use_intra_process) {
+      
   RCLCPP_INFO_STREAM(logger_,
                      "OBCameraNode: use_intra_process: " << (use_intra_process ? "ON" : "OFF"));
   is_running_.store(true);
@@ -96,6 +112,10 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
     xy_table_data_ = new float[xy_table_data_size_];
   }
   is_camera_node_initialized_ = true;
+
+  
+  computeTransformationMatrix(urdf_x_, urdf_y_, urdf_z_, urdf_roll_, urdf_pitch_, urdf_yaw_, transform_matrix);
+
 }
 
 template <class T>
@@ -1249,6 +1269,13 @@ void OBCameraNode::getParameters() {
   setAndGetNodeParameter<int>(depth_ae_roi_right_, "depth_ae_roi_right", -1);
   setAndGetNodeParameter<int>(depth_ae_roi_bottom_, "depth_ae_roi_bottom", -1);
 
+  setAndGetNodeParameter<double>(urdf_x_, "urdf_x", 0.0);
+  setAndGetNodeParameter<double>(urdf_y_, "urdf_y", 0.0);
+  setAndGetNodeParameter<double>(urdf_z_, "urdf_z", 0.0);
+  setAndGetNodeParameter<double>(urdf_roll_, "urdf_roll", 0.0);
+  setAndGetNodeParameter<double>(urdf_pitch_, "urdf_pith", 0.0);
+  setAndGetNodeParameter<double>(urdf_yaw_, "urdf_yaw", 0.0);
+
   setAndGetNodeParameter<std::string>(time_domain_, "time_domain", "device");
   auto device_info = device_->getDeviceInfo();
   CHECK_NOTNULL(device_info.get());
@@ -1540,6 +1567,44 @@ void OBCameraNode::publishPointCloud(const std::shared_ptr<ob::FrameSet> &frame_
   }
 }
 
+
+void OBCameraNode::computeTransformationMatrix(float x, float y, float z,
+                                 float roll, float pitch, float yaw,
+                                 float T[16])
+{
+    float c1 = cos(yaw);
+    float s1 = sin(yaw);
+    float c2 = cos(pitch);
+    float s2 = sin(pitch);
+    float c3 = cos(roll);
+    float s3 = sin(roll);
+
+    // Rotation matrix elements
+    T[0] = c1 * c2;
+    T[1] = c1 * s2 * s3 - s1 * c3;
+    T[2] = c1 * s2 * c3 + s1 * s3;
+    T[3] = x;
+
+    T[4] = s1 * c2;
+    T[5] = s1 * s2 * s3 + c1 * c3;
+    T[6] = s1 * s2 * c3 - c1 * s3;
+    T[7] = y;
+
+    T[8] = -s2;
+    T[9] = c2 * s3;
+    T[10] = c2 * c3;
+    T[11] = z;
+
+    // Last row
+    T[12] = 0.0f;
+    T[13] = 0.0f;
+    T[14] = 0.0f;
+    T[15] = 1.0f;
+}
+
+
+
+
 void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {
   (void)frame_set;
   if (!depth_cloud_pub_ || depth_cloud_pub_->get_subscription_count() == 0 ||
@@ -1575,6 +1640,83 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
   }
   auto point_size = result_frame->dataSize() / sizeof(OBPoint);
   auto *points = static_cast<OBPoint *>(result_frame->data());
+
+  // start Mizdan
+
+size_t N = 1'000'000;
+// Allocate laser scan buffer
+const int num_steps = 360;
+const int num_max_scans = 16;
+const float min_height = -1.0f;
+const float max_height = 3.0f;
+const float min_range = 0.1f;
+const float max_range = 100.0f;
+const float min_angle = -3.14159f;
+const float max_angle = 3.14159f;
+const float angle_increment = (max_angle - min_angle) / num_steps;
+const float height_increment = (max_height - min_height) / num_max_scans;
+
+        
+if (!alocat) {
+// Allocate UMA memory
+cudaMallocManaged(&d_x, N * sizeof(float));
+cudaMallocManaged(&d_y, N * sizeof(float));
+cudaMallocManaged(&d_z, N * sizeof(float));
+cudaMallocManaged(&d_ranges, 2* num_steps * num_max_scans * sizeof(float));
+// Initialize ranges to NaN
+for (int i = 0; i < num_steps * num_max_scans; ++i)
+{
+    d_ranges[i] = std::numeric_limits<float>::quiet_NaN();
+}
+alocat = true;
+}
+
+// Initialize
+for (size_t i = 0; i < N; ++i)
+{
+    d_x[i] = static_cast<float>(i);
+    d_y[i] = static_cast<float>(i) * 2.0f;
+    d_z[i] = static_cast<float>(i) * 3.0f;
+}
+
+
+float* d_matrix;
+cudaMallocManaged(&d_matrix, 16 * sizeof(float));
+memcpy(d_matrix, transform_matrix, 16 * sizeof(float));
+
+// Call kernel
+launch_transform_kernel_matrix(d_x, d_y, d_z, N, d_matrix);
+
+
+// Call after transform kernel:
+launch_pointcloud_to_laserscan_kernel(
+    d_x, d_y, d_z, N,
+    d_ranges,  // output: cudaMallocManaged(&d_ranges, num_steps * num_max_scans * sizeof(float));
+    min_height, height_increment,
+    num_steps,
+    min_range, max_range,
+    min_angle, max_angle,
+    angle_increment);
+
+
+// Print first point
+RCLCPP_INFO(logger_, "First point: (%f, %f, %f)", d_x[0], d_y[0], d_z[0]);
+
+// Free
+// if (!alocat) {
+// cudaFree(d_x);
+// cudaFree(d_y);
+// cudaFree(d_z);
+// cudaFree(d_matrix);
+// alocat = true;
+// }
+
+    
+
+  RCLCPP_ERROR_STREAM(logger_, "xxxxxxxxxxxxxxxxxxx");
+
+  // end mizdan
+
   auto width = depth_frame->width();
   auto height = depth_frame->height();
   auto point_cloud_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
