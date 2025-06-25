@@ -126,7 +126,9 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
     enable_laser_scan_ = false;
   }
 
-  computeTransformationMatrix(urdf_x_, urdf_y_, urdf_z_, urdf_roll_, urdf_pitch_, urdf_yaw_, d_matrix);
+  // Initialize TF2 buffer and listener for dynamic transform lookup
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
 }
 
@@ -1289,15 +1291,10 @@ void OBCameraNode::getParameters() {
   setAndGetNodeParameter<int>(depth_ae_roi_right_, "depth_ae_roi_right", -1);
   setAndGetNodeParameter<int>(depth_ae_roi_bottom_, "depth_ae_roi_bottom", -1);
 
-  setAndGetNodeParameter<double>(urdf_x_, "urdf_x", 0.0);
-  setAndGetNodeParameter<double>(urdf_y_, "urdf_y", 0.0);
-  setAndGetNodeParameter<double>(urdf_z_, "urdf_z", 0.0);
-  setAndGetNodeParameter<double>(urdf_roll_, "urdf_roll", 0.0);
-  setAndGetNodeParameter<double>(urdf_pitch_, "urdf_pith", 0.0);
-  setAndGetNodeParameter<double>(urdf_yaw_, "urdf_yaw", 0.0);
+  // URDF parameters removed - using TF lookup instead
 
   setAndGetNodeParameter(enable_laser_scan_, "enable_laser_scan", false);
-  setAndGetNodeParameter<std::string>(laser_scan_frame_id_, "laser_scan_frame_id", camera_name_ + "_laser");
+  setAndGetNodeParameter<std::string>(laser_scan_frame_id_, "laser_scan_frame_id", camera_name_ + "_lidar");
 
   setAndGetNodeParameter<std::string>(time_domain_, "time_domain", "device");
   auto device_info = device_->getDeviceInfo();
@@ -1615,42 +1612,28 @@ float OBCameraNode::getCameraHorizontalFOV() {
   }
 }
 
-void OBCameraNode::computeTransformationMatrix(float x, float y, float z,
-                                 float roll, float pitch, float yaw,
-                                 float T[16])
-{
-    float c1 = cos(yaw);
-    float s1 = sin(yaw);
-    float c2 = cos(pitch);
-    float s2 = sin(pitch);
-    float c3 = cos(roll);
-    float s3 = sin(roll);
+// Legacy function - replaced with TF-based lookup
+// void OBCameraNode::computeTransformationMatrix(...) - removed
 
-    // Rotation matrix elements
-    T[0] = c1 * c2;
-    T[1] = c1 * s2 * s3 - s1 * c3;
-    T[2] = c1 * s2 * c3 + s1 * s3;
-    T[3] = x;
-
-    T[4] = s1 * c2;
-    T[5] = s1 * s2 * s3 + c1 * c3;
-    T[6] = s1 * s2 * c3 - c1 * s3;
-    T[7] = y;
-
-    T[8] = -s2;
-    T[9] = c2 * s3;
-    T[10] = c2 * c3;
-    T[11] = z;
-
-    // Last row
-    T[12] = 0.0f;
-    T[13] = 0.0f;
-    T[14] = 0.0f;
-    T[15] = 1.0f;
+void OBCameraNode::transformToMatrix(const geometry_msgs::msg::TransformStamped& transform, float* matrix) {
+  const auto& t = transform.transform.translation;
+  const auto& q = transform.transform.rotation;
+  
+  // Convert quaternion to rotation matrix
+  float qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+  float qx2 = qx * qx, qy2 = qy * qy, qz2 = qz * qz;
+  
+  // Row-major 4x4 transformation matrix
+  matrix[0] = 1 - 2 * (qy2 + qz2); matrix[1] = 2 * (qx * qy - qz * qw); matrix[2] = 2 * (qx * qz + qy * qw); matrix[3] = t.x;
+  matrix[4] = 2 * (qx * qy + qz * qw); matrix[5] = 1 - 2 * (qx2 + qz2); matrix[6] = 2 * (qy * qz - qx * qw); matrix[7] = t.y;
+  matrix[8] = 2 * (qx * qz - qy * qw); matrix[9] = 2 * (qy * qz + qx * qw); matrix[10] = 1 - 2 * (qx2 + qy2); matrix[11] = t.z;
+  matrix[12] = 0.0f; matrix[13] = 0.0f; matrix[14] = 0.0f; matrix[15] = 1.0f;
 }
 
-
-
+void OBCameraNode::setIdentityMatrix(float* matrix) {
+  for (int i = 0; i < 16; i++) matrix[i] = 0.0f;
+  matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
+}
 
 void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {
   if (((!depth_cloud_pub_ || depth_cloud_pub_->get_subscription_count() == 0) &&
@@ -1777,16 +1760,31 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
   }
 
   if (valid_count > 30) {
-    // Set transformation matrix (once per frame)
+    // Get transformation matrix from TF
     auto frame_timestamp = getFrameTimestampUs(depth_frame);
     auto timestamp = fromUsToROSTime(frame_timestamp);
-    computeTransformationMatrix(urdf_x_, urdf_y_, urdf_z_, urdf_roll_, urdf_pitch_, urdf_yaw_, d_matrix);
+    
+    // Lookup transform from camera frame to lidar frame
+    std::string source_frame = OPTICAL_FRAME_ID(DEPTH);
+    std::string target_frame = laser_scan_frame_id_;
+    
+    bool transform_success __attribute__((unused)) = false;
+    try {
+      auto transform = tf_buffer_->lookupTransform(target_frame, source_frame, timestamp, rclcpp::Duration::from_nanoseconds(100000000)); // 0.1s timeout
+      transformToMatrix(transform, d_matrix);
+      transform_success = true;
+    } catch (const tf2::TransformException& ex) {
+      RCLCPP_WARN_THROTTLE(logger_, *node_->get_clock(), 1000, 
+        "Failed to lookup transform from %s to %s: %s", 
+        source_frame.c_str(), target_frame.c_str(), ex.what());
+      // Use identity matrix as fallback
+      setIdentityMatrix(d_matrix);
+    }
     
     const float min_range = 0.1f, max_range = 30.0f;
     
-    const float min_height = -1.0f;    // meters
-    const float max_height = 3.0f;     // meters
-    const float height_increment = (max_height - min_height) / 6.0f;  
+    const float min_height = 0.1f;    // meters
+    const float max_height = 0.5f;     // meters
    
     float camera_fov = getCameraHorizontalFOV();
     const float min_angle = -camera_fov / 2.0f;
@@ -1796,8 +1794,8 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     const float angle_increment = 0.05;
     LASER_STEPS = camera_fov / angle_increment;
 
-    // Transform points
-    // launch_transform_kernel_matrix(d_x, d_y, d_z, valid_count, d_matrix);
+    // Transform points to _lidar frame
+    launch_transform_kernel_matrix(d_x, d_y, d_z, valid_count, d_matrix);
     for (int i = 0; i < LASER_STEPS; ++i) {
       d_ranges[i] = std::numeric_limits<float>::quiet_NaN();
     }
@@ -1807,7 +1805,7 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
         d_x, d_y, d_z, valid_count,     // Point cloud data
         d_ranges,                       // Output ranges array
         min_height,                     // Height filtering
-        height_increment,               // Height layer spacing
+        max_height,                     // Height filtering
         LASER_STEPS,                    // Number of angular steps
         min_range, max_range,           // Range limits
         min_angle, max_angle,           // Angular limits
@@ -1817,7 +1815,7 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     // Publish laser scan
     auto scan_msg = sensor_msgs::msg::LaserScan();
     scan_msg.header.stamp = timestamp;
-    scan_msg.header.frame_id = frame_id;
+    scan_msg.header.frame_id = laser_scan_frame_id_;
     scan_msg.angle_min = min_angle;
     scan_msg.angle_max = max_angle;
     scan_msg.angle_increment = angle_increment;
