@@ -31,9 +31,13 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Vector3.h>
 #include <tf2/LinearMath/Transform.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
@@ -73,26 +77,26 @@
 
 #define STREAM_NAME(sip)                                                                       \
   (static_cast<std::ostringstream&&>(std::ostringstream()                                      \
-                                     << _stream_name[sip.first]                                \
+                                     << stream_name_[sip]                                      \
                                      << ((sip.second > 0) ? std::to_string(sip.second) : ""))) \
       .str()
 #define FRAME_ID(sip)                                                                              \
   (static_cast<std::ostringstream&&>(std::ostringstream()                                          \
-                                     << getNamespaceStr() << "_" << STREAM_NAME(sip) << "_frame")) \
+                                     << camera_name_ << "_" << STREAM_NAME(sip) << "_frame"))      \
       .str()
 #define OPTICAL_FRAME_ID(sip)                                                                     \
   (static_cast<std::ostringstream&&>(                                                             \
-       std::ostringstream() << getNamespaceStr() << "_" << STREAM_NAME(sip) << "_optical_frame")) \
+       std::ostringstream() << camera_name_ << "_" << STREAM_NAME(sip) << "_optical_frame"))     \
       .str()
 #define ALIGNED_DEPTH_TO_FRAME_ID(sip)                                            \
   (static_cast<std::ostringstream&&>(std::ostringstream()                         \
-                                     << getNamespaceStr() << "_aligned_depth_to_" \
+                                     << camera_name_ << "_aligned_depth_to_" \
                                      << STREAM_NAME(sip) << "_frame"))            \
       .str()
 #define BASE_FRAME_ID() \
-  (static_cast<std::ostringstream&&>(std::ostringstream() << getNamespaceStr() << "_link")).str()
+  (static_cast<std::ostringstream&&>(std::ostringstream() << camera_name_ << "_link")).str()
 #define ODOM_FRAME_ID()                                                                           \
-  (static_cast<std::ostringstream&&>(std::ostringstream() << getNamespaceStr() << "_odom_frame")) \
+  (static_cast<std::ostringstream&&>(std::ostringstream() << camera_name_ << "_odom_frame")) \
       .str()
 
 namespace orbbec_camera {
@@ -363,7 +367,9 @@ std::string laser_scan_frame_id_;
   void setupDepthPostProcessFilter();
 
 
-void computeTransformationMatrix(float urdf_x_,float  urdf_y_,float  urdf_z_,float  urdf_roll_,float  urdf_pitch_,float  urdf_yaw_,float* transform_matrix);
+  // TF-based transformation helpers
+  void transformToMatrix(const geometry_msgs::msg::TransformStamped& transform, float* matrix);
+  void setIdentityMatrix(float* matrix);
 
  private:
   rclcpp::Node* node_ = nullptr;
@@ -623,12 +629,9 @@ void computeTransformationMatrix(float urdf_x_,float  urdf_y_,float  urdf_z_,flo
   int depth_ae_roi_bottom_ = -1;
 
 
-  double urdf_x_ = 0.0;
-  double urdf_y_ = 0.0;
-  double urdf_z_ = 0.0;
-  double urdf_roll_ = 0.0;
-  double urdf_pitch_ = 0.0;
-  double urdf_yaw_ = 0.0;
+  // TF2 for dynamic transform lookup
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   std::string frame_aggregate_mode_ = "ANY";  // # full_frame、color_frame、ANY or disable
 };

@@ -27,7 +27,7 @@ __global__
 void pointcloud_to_laserscan_kernel(
     const float* x, const float* y, const float* z, size_t N,
     float* ranges,
-    float min_height, float height_increment,
+    float min_height, float max_height,
     int num_steps,
     float min_range, float max_range,
     float min_angle, float max_angle,
@@ -39,6 +39,9 @@ void pointcloud_to_laserscan_kernel(
         float xi = x[idx];
         float yi = y[idx];
         float zi = z[idx];
+
+        if (zi < min_height || zi > max_height)
+            return;
 
         const float range = hypotf(xi, yi);
         if (range < min_range || range > max_range)

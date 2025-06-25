@@ -39,6 +39,7 @@ set(dependencies
   tf2_msgs
   tf2_ros
   tf2_sensor_msgs
+  tf2_geometry_msgs
   Threads
   diagnostic_updater
   diagnostic_msgs
