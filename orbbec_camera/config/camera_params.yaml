@@ -23,7 +23,19 @@ color_format: "YUYV"
 enable_color_auto_exposure: false
 color_exposure: 50 # 5ms
 color_gain: -1 # -1 default
+
+# laser scan params
 enable_laser_scan: true
+laser_scan_frame_id: "camera_lidar"
+laser_scan_min_range: 0.1        # meters
+laser_scan_max_range: 30.0       # meters  
+laser_scan_min_height: 0.1       # meters (height filtering)
+laser_scan_max_height: 0.5       # meters (height filtering)
+laser_scan_angle_min: -1.5708    # radians (-π/2, -90 degrees)
+laser_scan_angle_max: 1.5708     # radians (+π/2, +90 degrees)
+laser_scan_angle_increment: 0.05 # radians (~2.86 degrees)
+enable_laser_scan_filter: true   # enable median filtering
+laser_scan_filter_window_size: 5 # filter window size (odd number, 3-9 recommended)
 
 # depth params
 depth_width: 640

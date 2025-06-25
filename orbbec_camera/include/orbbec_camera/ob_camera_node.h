@@ -172,6 +172,15 @@ int LASER_STEPS = 360;
 rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laser_scan_pub_;
 bool enable_laser_scan_ = false;
 std::string laser_scan_frame_id_;
+float laser_scan_min_range_ = 0.1f;
+float laser_scan_max_range_ = 30.0f;
+float laser_scan_min_height_ = 0.1f;
+float laser_scan_max_height_ = 0.5f;
+float laser_scan_angle_min_ = -1.5708f;  // -π/2
+float laser_scan_angle_max_ = 1.5708f;   // +π/2
+float laser_scan_angle_increment_ = 0.05f;
+bool enable_laser_scan_filter_ = true;
+int laser_scan_filter_window_size_ = 5;
 
  private:
   struct IMUData {
@@ -209,6 +218,8 @@ std::string laser_scan_frame_id_;
   void stopStreams();
 
   float getCameraHorizontalFOV();
+  
+  void applyMedianFilter(std::vector<float>& ranges, int window_size);
 
   void stopIMU();
 

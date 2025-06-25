@@ -1295,6 +1295,15 @@ void OBCameraNode::getParameters() {
 
   setAndGetNodeParameter(enable_laser_scan_, "enable_laser_scan", false);
   setAndGetNodeParameter<std::string>(laser_scan_frame_id_, "laser_scan_frame_id", camera_name_ + "_lidar");
+  setAndGetNodeParameter(laser_scan_min_range_, "laser_scan_min_range", 0.1f);
+  setAndGetNodeParameter(laser_scan_max_range_, "laser_scan_max_range", 30.0f);
+  setAndGetNodeParameter(laser_scan_min_height_, "laser_scan_min_height", 0.1f);
+  setAndGetNodeParameter(laser_scan_max_height_, "laser_scan_max_height", 0.5f);
+  setAndGetNodeParameter(laser_scan_angle_min_, "laser_scan_angle_min", -1.5708f);
+  setAndGetNodeParameter(laser_scan_angle_max_, "laser_scan_angle_max", 1.5708f);
+  setAndGetNodeParameter(laser_scan_angle_increment_, "laser_scan_angle_increment", 0.05f);
+  setAndGetNodeParameter(enable_laser_scan_filter_, "enable_laser_scan_filter", true);
+  setAndGetNodeParameter(laser_scan_filter_window_size_, "laser_scan_filter_window_size", 5);
 
   setAndGetNodeParameter<std::string>(time_domain_, "time_domain", "device");
   auto device_info = device_->getDeviceInfo();
@@ -1612,6 +1621,43 @@ float OBCameraNode::getCameraHorizontalFOV() {
   }
 }
 
+void OBCameraNode::applyMedianFilter(std::vector<float>& ranges, int window_size) {
+  if (window_size <= 1 || ranges.empty()) return;
+  
+  // Ensure window size is odd
+  if (window_size % 2 == 0) window_size++;
+  
+  std::vector<float> filtered_ranges = ranges;
+  int half_window = window_size / 2;
+  
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    std::vector<float> window;
+    
+    // Collect values within the window
+    for (int j = -half_window; j <= half_window; ++j) {
+      int idx = static_cast<int>(i) + j;
+      if (idx >= 0 && idx < static_cast<int>(ranges.size())) {
+        float val = ranges[idx];
+        if (!std::isnan(val) && val > 0.0f) {  // Only include valid ranges
+          window.push_back(val);
+        }
+      }
+    }
+    
+    // Calculate median if we have enough valid values
+    if (!window.empty()) {
+      std::sort(window.begin(), window.end());
+      size_t mid = window.size() / 2;
+      filtered_ranges[i] = (window.size() % 2 == 0) ? 
+                          (window[mid-1] + window[mid]) / 2.0f : 
+                          window[mid];
+    }
+    // If no valid values in window, keep original value
+  }
+  
+  ranges = filtered_ranges;
+}
+
 // Legacy function - replaced with TF-based lookup
 // void OBCameraNode::computeTransformationMatrix(...) - removed
 
@@ -1781,18 +1827,17 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
       setIdentityMatrix(d_matrix);
     }
     
-    const float min_range = 0.1f, max_range = 30.0f;
+    const float min_range = laser_scan_min_range_;
+    const float max_range = laser_scan_max_range_;
     
-    const float min_height = 0.1f;    // meters
-    const float max_height = 0.5f;     // meters
+    const float min_height = laser_scan_min_height_;
+    const float max_height = laser_scan_max_height_;
    
-    float camera_fov = getCameraHorizontalFOV();
-    const float min_angle = -camera_fov / 2.0f;
-    const float max_angle = camera_fov / 2.0f;
+    const float min_angle = laser_scan_angle_min_;
+    const float max_angle = laser_scan_angle_max_;
+    const float angle_increment = laser_scan_angle_increment_;
     
-    // const float angle_increment = camera_fov / LASER_STEPS;
-    const float angle_increment = 0.05;
-    LASER_STEPS = camera_fov / angle_increment;
+    LASER_STEPS = (max_angle - min_angle) / angle_increment;
 
     // Transform points to _lidar frame
     launch_transform_kernel_matrix(d_x, d_y, d_z, valid_count, d_matrix);
@@ -1829,8 +1874,12 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     scan_msg.intensities.resize(LASER_STEPS, 0.0f);
     
     for (int i = 0; i < LASER_STEPS; ++i) {
-      
       scan_msg.ranges[i] = d_ranges[i];
+    }
+    
+    // Apply median filter if enabled
+    if (enable_laser_scan_filter_ && laser_scan_filter_window_size_ > 1) {
+      applyMedianFilter(scan_msg.ranges, laser_scan_filter_window_size_);
     }
     
     laser_scan_pub_->publish(scan_msg);
