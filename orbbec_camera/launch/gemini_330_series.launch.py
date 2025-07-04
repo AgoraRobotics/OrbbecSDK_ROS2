@@ -193,6 +193,18 @@ def generate_launch_description():
         DeclareLaunchArgument('enable_heartbeat', default_value='false'),
         DeclareLaunchArgument('enable_hardware_reset', default_value='false'),
         DeclareLaunchArgument('enable_laser_scan', default_value='true'),
+        DeclareLaunchArgument('laser_scan_min_range', default_value='0.1'),
+        DeclareLaunchArgument('laser_scan_max_range', default_value='30.0'),
+        DeclareLaunchArgument('laser_scan_min_height', default_value='0.1'),
+        DeclareLaunchArgument('laser_scan_max_height', default_value='1.6'),
+        DeclareLaunchArgument('laser_scan_angle_min', default_value='-1.5708'),
+        DeclareLaunchArgument('laser_scan_angle_max', default_value='1.5708'),
+        DeclareLaunchArgument('laser_scan_angle_increment', default_value='0.005'),
+        DeclareLaunchArgument('enable_laser_scan_filter', default_value='false'),
+        DeclareLaunchArgument('laser_scan_filter_window_size', default_value='5'),
+        
+        
+       
 
         DeclareLaunchArgument('frame_aggregate_mode', default_value='ANY'), # full_frame、color_frame、ANY or disable
     ]

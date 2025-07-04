@@ -1293,16 +1293,16 @@ void OBCameraNode::getParameters() {
 
   // URDF parameters removed - using TF lookup instead
 
-  setAndGetNodeParameter(enable_laser_scan_, "enable_laser_scan", false);
+  setAndGetNodeParameter(enable_laser_scan_, "enable_laser_scan", true);
   setAndGetNodeParameter<std::string>(laser_scan_frame_id_, "laser_scan_frame_id", camera_name_ + "_lidar");
   setAndGetNodeParameter(laser_scan_min_range_, "laser_scan_min_range", 0.1f);
   setAndGetNodeParameter(laser_scan_max_range_, "laser_scan_max_range", 30.0f);
-  setAndGetNodeParameter(laser_scan_min_height_, "laser_scan_min_height", 0.1f);
-  setAndGetNodeParameter(laser_scan_max_height_, "laser_scan_max_height", 0.5f);
+  setAndGetNodeParameter(laser_scan_min_height_, "laser_scan_min_height", 0.15f);
+  setAndGetNodeParameter(laser_scan_max_height_, "laser_scan_max_height", 2.0f);
   setAndGetNodeParameter(laser_scan_angle_min_, "laser_scan_angle_min", -1.5708f);
   setAndGetNodeParameter(laser_scan_angle_max_, "laser_scan_angle_max", 1.5708f);
-  setAndGetNodeParameter(laser_scan_angle_increment_, "laser_scan_angle_increment", 0.05f);
-  setAndGetNodeParameter(enable_laser_scan_filter_, "enable_laser_scan_filter", true);
+  setAndGetNodeParameter(laser_scan_angle_increment_, "laser_scan_angle_increment", 0.005f);
+  setAndGetNodeParameter(enable_laser_scan_filter_, "enable_laser_scan_filter", false);
   setAndGetNodeParameter(laser_scan_filter_window_size_, "laser_scan_filter_window_size", 5);
 
   setAndGetNodeParameter<std::string>(time_domain_, "time_domain", "device");

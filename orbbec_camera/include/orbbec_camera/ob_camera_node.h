@@ -167,19 +167,19 @@ float* d_matrix = nullptr;
 bool cuda_initialized = false;
 
 static constexpr size_t MAX_POINTS = 1000000;  // Adjustable
-int LASER_STEPS = 360;
+int LASER_STEPS = 720; //360;
 
 rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laser_scan_pub_;
 bool enable_laser_scan_ = false;
 std::string laser_scan_frame_id_;
 float laser_scan_min_range_ = 0.1f;
 float laser_scan_max_range_ = 30.0f;
-float laser_scan_min_height_ = 0.1f;
+float laser_scan_min_height_ = 0.0f;
 float laser_scan_max_height_ = 0.5f;
 float laser_scan_angle_min_ = -1.5708f;  // -π/2
 float laser_scan_angle_max_ = 1.5708f;   // +π/2
-float laser_scan_angle_increment_ = 0.05f;
-bool enable_laser_scan_filter_ = true;
+float laser_scan_angle_increment_ = 0.01f;
+bool enable_laser_scan_filter_ = false;
 int laser_scan_filter_window_size_ = 5;
 
  private:
