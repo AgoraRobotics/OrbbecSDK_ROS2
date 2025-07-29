@@ -44,7 +44,11 @@ void pointcloud_to_laserscan_kernel(
             return;
 
         const float range = hypotf(xi, yi);
-        if (range < min_range || range > max_range)
+
+        if (range > 2.0 && zi < 0.1f)
+            return;
+
+        if (xi < min_range || xi > max_range)
             return;
 
         const float angle = atan2f(yi, xi);
