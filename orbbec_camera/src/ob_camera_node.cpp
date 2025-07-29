@@ -1856,7 +1856,7 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
         min_angle, max_angle,           // Angular limits
         angle_increment                 // Angular resolution
     );
-    RCLCPP_INFO_STREAM(logger_, "Laser scan published");
+    //RCLCPP_INFO_STREAM(logger_, "Laser scan published");
     // Publish laser scan
     auto scan_msg = sensor_msgs::msg::LaserScan();
     scan_msg.header.stamp = timestamp;
