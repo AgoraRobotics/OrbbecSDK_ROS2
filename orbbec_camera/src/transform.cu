@@ -1,5 +1,9 @@
 #include <cuda_runtime.h>
+#include <cstdio>
 
+// -------------------
+// Transform kernel
+// -------------------
 __global__ void transform_kernel_matrix(
     float* in_x, float* in_y, float* in_z,
     const float* T,  // 16-element array: row-major 4x4 matrix
@@ -14,15 +18,17 @@ __global__ void transform_kernel_matrix(
         float out_x = T[0] * x + T[1] * y + T[2] * z + T[3];
         float out_y = T[4] * x + T[5] * y + T[6] * z + T[7];
         float out_z = T[8] * x + T[9] * y + T[10] * z + T[11];
-        atomicExch(in_x + idx, out_x);
-        atomicExch(in_y + idx, out_y);
-        atomicExch(in_z + idx, out_z);
+
+        // No atomic needed since each thread writes its own index
+        in_x[idx] = out_x;
+        in_y[idx] = out_y;
+        in_z[idx] = out_z;
     }
 }
 
-
-
-
+// -------------------
+// PointCloud → LaserScan kernel
+// -------------------
 __global__
 void pointcloud_to_laserscan_kernel(
     const float* x, const float* y, const float* z, size_t N,
@@ -45,7 +51,7 @@ void pointcloud_to_laserscan_kernel(
 
         const float range = hypotf(xi, yi);
 
-        if (range > 2.0 && zi < 0.1f)
+        if (range > 2.0f && zi < 0.1f)
             return;
 
         if (xi < min_range || xi > max_range)
@@ -55,7 +61,7 @@ void pointcloud_to_laserscan_kernel(
         if (angle < min_angle || angle > max_angle)
             return;
 
-        int index = (angle - min_angle) / angle_increment;
+        int index = (int)((angle - min_angle) / angle_increment);
         if (index < 0 || index >= num_steps)
             return;
 
@@ -67,6 +73,19 @@ void pointcloud_to_laserscan_kernel(
     }
 }
 
+// -------------------
+// Host wrappers with error checking
+// -------------------
+
+static inline void checkCudaError(const char* msg)
+{
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error after %s: %s\n",
+                msg, cudaGetErrorString(err));
+    }
+}
+
 extern "C"
 void launch_transform_kernel_matrix(float* x, float* y, float* z, size_t N, const float* matrix)
 {
@@ -74,6 +93,7 @@ void launch_transform_kernel_matrix(float* x, float* y, float* z, size_t N, cons
     int numBlocks = (N + blockSize - 1) / blockSize;
 
     transform_kernel_matrix<<<numBlocks, blockSize>>>(x, y, z, matrix, N);
+    checkCudaError("transform_kernel_matrix launch");
     cudaDeviceSynchronize();
 }
 
@@ -81,7 +101,7 @@ extern "C"
 void launch_pointcloud_to_laserscan_kernel(
     const float* x, const float* y, const float* z, size_t N,
     float* ranges,
-    float min_height, float height_increment,
+    float min_height, float max_height,   // <-- FIXED (was min_height, height_increment)
     int num_steps,
     float min_range, float max_range,
     float min_angle, float max_angle,
@@ -93,11 +113,12 @@ void launch_pointcloud_to_laserscan_kernel(
     pointcloud_to_laserscan_kernel<<<numBlocks, blockSize>>>(
         x, y, z, N,
         ranges,
-        min_height, height_increment,
+        min_height, max_height,   // <-- FIXED
         num_steps,
         min_range, max_range,
         min_angle, max_angle,
         angle_increment);
 
+    checkCudaError("pointcloud_to_laserscan_kernel launch");
     cudaDeviceSynchronize();
 }

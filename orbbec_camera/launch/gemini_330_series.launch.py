@@ -241,9 +241,11 @@ def generate_launch_description():
                                 plugin="orbbec_camera::OBCameraNodeDriver",
                                 name=LaunchConfiguration("camera_name"),
                                 parameters=params,
+                                extra_arguments=[{"use_intra_process_comms": True}],
                             ),
                         ],
                         output="screen",
+                        respawn=True,
                     )
                 ])
             ]
