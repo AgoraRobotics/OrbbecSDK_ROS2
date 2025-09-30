@@ -27,11 +27,25 @@
 
 namespace orbbec_camera {
 
-JetsonNvJPEGDecoder::JetsonNvJPEGDecoder(int width, int height) : JPEGDecoder(width, height) {}
+  JetsonNvJPEGDecoder::JetsonNvJPEGDecoder(int width, int height) : JPEGDecoder(width, height) {
+    decoder_ = NvJPEGDecoder::createJPEGDecoder("jpegdec");
+    if (!decoder_) {
+      throw std::runtime_error("Failed to create NVIDIA JPEG decoder");
+    }
+  }
 
-JetsonNvJPEGDecoder::~JetsonNvJPEGDecoder() { delete decoder_; }
+  JetsonNvJPEGDecoder::~JetsonNvJPEGDecoder() { 
+    if (decoder_) {
+      delete decoder_; 
+      decoder_ = nullptr;
+    }
+  }
 
 bool JetsonNvJPEGDecoder::decode(const std::shared_ptr<ob::ColorFrame> &frame, uint8_t *dest) {
+  if (!decoder_) {
+    RCLCPP_ERROR_STREAM(rclcpp::get_logger("jetson_nv_decoder"), "Decoder not initialized");
+    return false;
+  }
   if (!isValidJPEG(frame)) {
     RCLCPP_ERROR_STREAM(rclcpp::get_logger("jetson_nv_decoder"), "Invalid JPEG frame");
     return false;
@@ -45,8 +59,8 @@ bool JetsonNvJPEGDecoder::decode(const std::shared_ptr<ob::ColorFrame> &frame, u
     data_size--;
   }
   int fd = -1;
-  decoder_ = NvJPEGDecoder::createJPEGDecoder("jpegdec");
-  std::shared_ptr<int> decoder_deleter(nullptr, [&](int *) { delete decoder_; });
+  // decoder_ = NvJPEGDecoder::createJPEGDecoder("jpegdec");
+  // std::shared_ptr<int> decoder_deleter(nullptr, [&](int *) { delete decoder_; });
   decoder_->decodeToFd(fd, data, data_size, pixfmt, width, height);
   if (pixfmt != V4L2_PIX_FMT_YUV422M) {
     RCLCPP_ERROR_STREAM(rclcpp::get_logger("jetson_nv_decoder"), "Unexpected pixfmt: " << pixfmt);

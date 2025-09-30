@@ -9,10 +9,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -O3")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fPIC -g3")
 set(CMAKE_BUILD_TYPE "Release")
 option(USE_RK_HW_DECODER "Use Rockchip hardware decoder" OFF)
-option(USE_NV_HW_DECODER "Use Nvidia hardware decoder" OFF)
+option(USE_NV_HW_DECODER "Use Nvidia hardware decoder" ON)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    add_compile_options(-Wall -Wextra -Werror -Wno-pedantic -Wno-array-bounds)
+    add_compile_options(-Wall -Wextra -Werror -Wno-pedantic -Wno-array-bounds -Wno-unknown-pragmas -Wno-sign-compare)
 endif()
 # Check if ROS Jazzy or iron is installed
 if("$ENV{ROS_DISTRO}" STREQUAL "jazzy")
@@ -44,6 +44,7 @@ set(dependencies
     tf2_msgs
     tf2_ros
     tf2_sensor_msgs
+    tf2_geometry_msgs
     Threads
     diagnostic_updater
     diagnostic_msgs
@@ -55,6 +56,12 @@ foreach(dep IN LISTS dependencies)
 endforeach()
 
 find_package(PkgConfig REQUIRED)
+
+find_package(CUDA REQUIRED)
+# Force use shared cudart
+# set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
+
+include_directories(${CUDA_INCLUDE_DIRS})
 
 if(USE_RK_HW_DECODER)
     pkg_search_module(RK_MPP REQUIRED rockchip_mpp)
@@ -134,6 +141,7 @@ set(SOURCE_FILES
     src/synced_imu_publisher.cpp
     src/utils.cpp
     src/jpeg_decoder.cpp
+    src/transform.cu
 )
 
 if(USE_RK_HW_DECODER)
@@ -148,6 +156,7 @@ endif()
 
 if(USE_NV_HW_DECODER)
     list(APPEND SOURCE_FILES src/jetson_nv_decoder.cpp)
+    list(APPEND SOURCE_FILES src/nvjpeg_decoder_manager.cpp)
     list(APPEND COMMON_INCLUDE_DIRS ${JETSON_MULTI_MEDIA_API_INCLUDE_DIR} ${LIBJPEG8B_INCLUDE_DIR})
     # append jetson_multimedia_api source files
     list(
@@ -169,18 +178,18 @@ if(USE_NV_HW_DECODER)
 endif()
 
 macro(add_orbbec_executable TARGET SOURCE)
-    add_executable(${TARGET} ${SOURCE})
+    cuda_add_executable(${TARGET} ${SOURCE})
     target_include_directories(${TARGET} PUBLIC ${COMMON_INCLUDE_DIRS})
     target_link_libraries(${TARGET} ${COMMON_LIBRARIES} ${PROJECT_NAME})
     ament_target_dependencies(${TARGET} ${dependencies})
 endmacro()
 
 # Define library and nodes
-add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES})
+cuda_add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES})
 
 ament_target_dependencies(${PROJECT_NAME} ${dependencies})
 target_include_directories(${PROJECT_NAME} PUBLIC ${COMMON_INCLUDE_DIRS})
-target_link_libraries(${PROJECT_NAME} ${COMMON_LIBRARIES})
+target_link_libraries(${PROJECT_NAME} ${COMMON_LIBRARIES} ${CUDA_LIBRARIES})
 
 rclcpp_components_register_node(
     ${PROJECT_NAME} PLUGIN "orbbec_camera::OBCameraNodeDriver" EXECUTABLE orbbec_camera_node

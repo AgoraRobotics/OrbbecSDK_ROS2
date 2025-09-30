@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *******************************************************************************/
-
+#include <cuda_runtime.h>
 #include "orbbec_camera/ob_camera_node.h"
 #include <rclcpp/rclcpp.hpp>
 #include <thread>
@@ -29,9 +29,23 @@
 #include "orbbec_camera/rk_mpp_decoder.h"
 #elif defined(USE_NV_HW_DECODER)
 #include "orbbec_camera/jetson_nv_decoder.h"
+#include "orbbec_camera/nvjpeg_decoder_manager.h"
 #endif
 
 #include <malloc.h>
+
+extern "C"
+void launch_transform_kernel_matrix(float* x, float* y, float* z, size_t N, const float* matrix);
+
+extern "C"
+void launch_pointcloud_to_laserscan_kernel(
+    const float* x, const float* y, const float* z, size_t N,
+    float* ranges,
+    float min_height, float height_increment,
+    int num_steps,
+    float min_range, float max_range,
+    float min_angle, float max_angle,
+    float angle_increment);
 
 namespace orbbec_camera {
 using namespace std::chrono_literals;
@@ -62,7 +76,24 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
 #if defined(USE_RK_HW_DECODER)
   jpeg_decoder_ = std::make_unique<RKJPEGDecoder>(width_[COLOR], height_[COLOR]);
 #elif defined(USE_NV_HW_DECODER)
-  jpeg_decoder_ = std::make_unique<JetsonNvJPEGDecoder>(width_[COLOR], height_[COLOR]);
+  // Create unique camera identifier from camera name and device serial number
+  auto device_info = device_->getDeviceInfo();
+  std::string camera_identifier = camera_name_ + "_" + device_info->serialNumber();
+
+  // Try to acquire hardware decoder slot through resource manager
+  auto& decoder_manager = NvJpegDecoderManager::getInstance();
+  bool use_hardware = decoder_manager.acquireDecoderSlot(camera_identifier);
+
+  if (use_hardware) {
+    RCLCPP_INFO_STREAM(logger_, "Using hardware NVJPEG decoder for camera: " << camera_identifier);
+    jpeg_decoder_ = std::make_unique<JetsonNvJPEGDecoder>(width_[COLOR], height_[COLOR]);
+    decoder_slot_acquired_ = true;
+    decoder_camera_id_ = camera_identifier;
+  } else {
+    RCLCPP_WARN_STREAM(logger_, "Hardware decoder slots exhausted, falling back to software decoding for camera: " << camera_identifier);
+    // Fallback to software decoding - we'll handle this in the decoding logic
+    decoder_slot_acquired_ = false;
+  }
 #endif
   if (enable_d2c_viewer_) {
     auto rgb_qos = getRMWQosProfileFromString(image_qos_[COLOR]);
@@ -77,6 +108,24 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
     xy_table_data_size_ = width_[DEPTH] * height_[DEPTH] * 2;
   }
   is_camera_node_initialized_ = true;
+
+  if (cudaMallocManaged(&d_x, MAX_POINTS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_y, MAX_POINTS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_z, MAX_POINTS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_ranges, LASER_STEPS * sizeof(float)) == cudaSuccess &&
+      cudaMallocManaged(&d_matrix, 16 * sizeof(float)) == cudaSuccess) {
+
+    cuda_initialized = true;
+
+  } else {
+    RCLCPP_ERROR_STREAM(logger_, "CUDA allocation failed - disabling laser scan");
+    cuda_initialized = false;
+    enable_laser_scan_ = false;
+  }
+
+  // Initialize TF2 buffer and listener for dynamic transform lookup
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   fps_counter_color_ = std::make_unique<FpsCounter>("Color", logger_, 1);
   fps_counter_depth_ = std::make_unique<FpsCounter>("Depth", logger_, 1);
@@ -169,6 +218,15 @@ void OBCameraNode::clean() noexcept {
   try {
     stopStreams();
     stopIMU();
+#if defined(USE_NV_HW_DECODER)
+    // Release hardware decoder slot before cleaning up
+    if (decoder_slot_acquired_) {
+      auto& decoder_manager = NvJpegDecoderManager::getInstance();
+      decoder_manager.releaseDecoderSlot(decoder_camera_id_);
+      decoder_slot_acquired_ = false;
+      RCLCPP_INFO_STREAM(logger_, "Released hardware decoder slot for camera: " << decoder_camera_id_);
+    }
+#endif
   } catch (...) {
     RCLCPP_WARN_STREAM(logger_, "Exception while stopping streams");
   }
@@ -178,6 +236,15 @@ void OBCameraNode::clean() noexcept {
     rgb_buffer_ = nullptr;
   } catch (...) {
     RCLCPP_WARN_STREAM(logger_, "Exception while cleaning up buffers");
+  }
+
+  if (cuda_initialized) {
+    if (d_x) cudaFree(d_x);
+    if (d_y) cudaFree(d_y);
+    if (d_z) cudaFree(d_z);
+    if (d_ranges) cudaFree(d_ranges);
+    if (d_matrix) cudaFree(d_matrix);
+    cuda_initialized = false;
   }
 
   RCLCPP_WARN_STREAM(logger_, "Destroy ~OBCameraNode DONE");
@@ -1835,6 +1902,20 @@ void OBCameraNode::getParameters() {
                                       "");
   setAndGetNodeParameter<bool>(enable_accel_data_correction_, "enable_accel_data_correction", true);
   setAndGetNodeParameter<bool>(enable_gyro_data_correction_, "enable_gyro_data_correction", true);
+
+  // URDF parameters removed - using TF lookup instead
+  setAndGetNodeParameter(enable_laser_scan_, "enable_laser_scan", true);
+  setAndGetNodeParameter<std::string>(laser_scan_frame_id_, "laser_scan_frame_id", camera_name_ + "_lidar");
+  setAndGetNodeParameter(laser_scan_min_range_, "laser_scan_min_range", 0.1f);
+  setAndGetNodeParameter(laser_scan_max_range_, "laser_scan_max_range", 30.0f);
+  setAndGetNodeParameter(laser_scan_min_height_, "laser_scan_min_height", 0.15f);
+  setAndGetNodeParameter(laser_scan_max_height_, "laser_scan_max_height", 2.0f);
+  setAndGetNodeParameter(laser_scan_angle_min_, "laser_scan_angle_min", -1.5708f);
+  setAndGetNodeParameter(laser_scan_angle_max_, "laser_scan_angle_max", 1.5708f);
+  setAndGetNodeParameter(laser_scan_angle_increment_, "laser_scan_angle_increment", 0.005f);
+  setAndGetNodeParameter(enable_laser_scan_filter_, "enable_laser_scan_filter", false);
+  setAndGetNodeParameter(laser_scan_filter_window_size_, "laser_scan_filter_window_size", 5);
+
   auto device_info = device_->getDeviceInfo();
   CHECK_NOTNULL(device_info.get());
   auto pid = device_info->getPid();
@@ -2110,6 +2191,9 @@ void OBCameraNode::setupPublishers() {
         "depth/points", rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(point_cloud_qos_profile),
                                     point_cloud_qos_profile));
   }
+  if (enable_laser_scan_) {
+    laser_scan_pub_ = node_->create_publisher<sensor_msgs::msg::LaserScan>("scan", 10);
+  }
   auto device_info = device_->getDeviceInfo();
   CHECK_NOTNULL(device_info.get());
   auto pid = device_info->getPid();
@@ -2254,9 +2338,91 @@ void OBCameraNode::publishPointCloud(const std::shared_ptr<ob::FrameSet> &frame_
   }
 }
 
+float OBCameraNode::getCameraHorizontalFOV() {
+  try {
+    auto camera_params = pipeline_->getCameraParam();
+    auto intrinsic = camera_params.depthIntrinsic;
+
+    // Calculate horizontal FOV from intrinsics
+    float fx = intrinsic.fx;  // Focal length X
+    float width = intrinsic.width;  // Image width
+
+    // FOV = 2 * atan(width / (2 * fx))
+    float fov_radians = 2.0f * atan(width / (2.0f * fx));
+
+    RCLCPP_INFO_STREAM(logger_, "Camera horizontal FOV: " << (fov_radians * 180.0f / 3.14159f) << " degrees");
+    return fov_radians;
+
+  } catch (...) {
+    RCLCPP_WARN_STREAM(logger_, "Could not get camera FOV, using default 60°");
+    return 1.0472f; // Default 60 degrees
+  }
+}
+
+void OBCameraNode::applyMedianFilter(std::vector<float>& ranges, int window_size) {
+  if (window_size <= 1 || ranges.empty()) return;
+
+  // Ensure window size is odd
+  if (window_size % 2 == 0) window_size++;
+
+  std::vector<float> filtered_ranges = ranges;
+  int half_window = window_size / 2;
+
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    std::vector<float> window;
+
+    // Collect values within the window
+    for (int j = -half_window; j <= half_window; ++j) {
+      int idx = static_cast<int>(i) + j;
+      if (idx >= 0 && idx < static_cast<int>(ranges.size())) {
+        float val = ranges[idx];
+        if (!std::isnan(val) && val > 0.0f) {  // Only include valid ranges
+          window.push_back(val);
+        }
+      }
+    }
+
+    // Calculate median if we have enough valid values
+    if (!window.empty()) {
+      std::sort(window.begin(), window.end());
+      size_t mid = window.size() / 2;
+      filtered_ranges[i] = (window.size() % 2 == 0) ? 
+                          (window[mid-1] + window[mid]) / 2.0f : 
+                          window[mid];
+    }
+    // If no valid values in window, keep original value
+  }
+
+  ranges = filtered_ranges;
+}
+
+// Legacy function - replaced with TF-based lookup
+// void OBCameraNode::computeTransformationMatrix(...) - removed
+
+void OBCameraNode::transformToMatrix(const geometry_msgs::msg::TransformStamped& transform, float* matrix) {
+  const auto& t = transform.transform.translation;
+  const auto& q = transform.transform.rotation;
+
+  // Convert quaternion to rotation matrix
+  float qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+  float qx2 = qx * qx, qy2 = qy * qy, qz2 = qz * qz;
+
+  // Row-major 4x4 transformation matrix
+  matrix[0] = 1 - 2 * (qy2 + qz2); matrix[1] = 2 * (qx * qy - qz * qw); matrix[2] = 2 * (qx * qz + qy * qw); matrix[3] = t.x;
+  matrix[4] = 2 * (qx * qy + qz * qw); matrix[5] = 1 - 2 * (qx2 + qz2); matrix[6] = 2 * (qy * qz - qx * qw); matrix[7] = t.y;
+  matrix[8] = 2 * (qx * qz - qy * qw); matrix[9] = 2 * (qy * qz + qx * qw); matrix[10] = 1 - 2 * (qx2 + qy2); matrix[11] = t.z;
+  matrix[12] = 0.0f; matrix[13] = 0.0f; matrix[14] = 0.0f; matrix[15] = 1.0f;
+}
+
+void OBCameraNode::setIdentityMatrix(float* matrix) {
+  for (int i = 0; i < 16; i++) matrix[i] = 0.0f;
+  matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
+}
+
 void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {
   (void)frame_set;
-  if (!depth_cloud_pub_ || depth_cloud_pub_->get_subscription_count() == 0 ||
+  if (((!depth_cloud_pub_ || depth_cloud_pub_->get_subscription_count() == 0) &&
+  (!enable_laser_scan_ || !laser_scan_pub_ || laser_scan_pub_->get_subscription_count() == 0)) ||
       !enable_point_cloud_) {
     return;
   }
@@ -2349,6 +2515,104 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
     }
   }
   depth_cloud_pub_->publish(std::move(point_cloud_msg));
+
+  if (enable_laser_scan_ && laser_scan_pub_ && laser_scan_pub_->get_subscription_count() > 0) {
+    size_t valid_count = 0;
+   size_t skip_step = std::max(1UL, point_size / MAX_POINTS);
+ 
+   for (size_t i = 0; i < point_size && valid_count < MAX_POINTS; i += skip_step) {
+     if (!isnan(points[i].x) && !isnan(points[i].y) && !isnan(points[i].z) &&
+         points[i].x != 0 && points[i].y != 0 && points[i].z != 0) {
+       d_x[valid_count] = points[i].x / 1000.0f;  // mm → meters
+       d_y[valid_count] = points[i].y / 1000.0f;  // mm → meters  
+       d_z[valid_count] = points[i].z / 1000.0f;  // mm → meters
+       valid_count++;
+     }
+   }
+ 
+   if (valid_count > 30) {
+     // Get transformation matrix from TF
+     auto frame_timestamp = getFrameTimestampUs(depth_frame);
+     auto timestamp = fromUsToROSTime(frame_timestamp);
+ 
+     // Lookup transform from camera frame to lidar frame
+     std::string source_frame = OPTICAL_FRAME_ID(DEPTH);
+     std::string target_frame = laser_scan_frame_id_;
+ 
+     bool transform_success __attribute__((unused)) = false;
+     try {
+       auto transform = tf_buffer_->lookupTransform(target_frame, source_frame, timestamp, rclcpp::Duration::from_nanoseconds(100000000)); // 0.1s timeout
+       transformToMatrix(transform, d_matrix);
+       transform_success = true;
+     } catch (const tf2::TransformException& ex) {
+       RCLCPP_WARN_THROTTLE(logger_, *node_->get_clock(), 1000, 
+         "Failed to lookup transform from %s to %s: %s", 
+         source_frame.c_str(), target_frame.c_str(), ex.what());
+       // Use identity matrix as fallback
+       setIdentityMatrix(d_matrix);
+     }
+ 
+     const float min_range = laser_scan_min_range_;
+     const float max_range = laser_scan_max_range_;
+ 
+     const float min_height = laser_scan_min_height_;
+     const float max_height = laser_scan_max_height_;
+ 
+     const float min_angle = laser_scan_angle_min_;
+     const float max_angle = laser_scan_angle_max_;
+     const float angle_increment = laser_scan_angle_increment_;
+ 
+     LASER_STEPS = (max_angle - min_angle) / angle_increment;
+ 
+     // Transform points to _lidar frame
+     launch_transform_kernel_matrix(d_x, d_y, d_z, valid_count, d_matrix);
+     for (int i = 0; i < LASER_STEPS; ++i) {
+       d_ranges[i] = std::numeric_limits<float>::quiet_NaN();
+     }
+ 
+ 
+     launch_pointcloud_to_laserscan_kernel(
+         d_x, d_y, d_z, valid_count,     // Point cloud data
+         d_ranges,                       // Output ranges array
+         min_height,                     // Height filtering
+         max_height,                     // Height filtering
+         LASER_STEPS,                    // Number of angular steps
+         min_range, max_range,           // Range limits
+         min_angle, max_angle,           // Angular limits
+         angle_increment                 // Angular resolution
+     );
+     //RCLCPP_INFO_STREAM(logger_, "Laser scan published");
+     // Publish laser scan
+     auto scan_msg = sensor_msgs::msg::LaserScan();
+     scan_msg.header.stamp = timestamp;
+     scan_msg.header.frame_id = laser_scan_frame_id_;
+     scan_msg.angle_min = min_angle;
+     scan_msg.angle_max = max_angle;
+     scan_msg.angle_increment = angle_increment;
+     scan_msg.range_min = min_range;
+     scan_msg.range_max = max_range;
+     scan_msg.scan_time = 0.067f;  // ~15 fps
+     scan_msg.time_increment = scan_msg.scan_time / LASER_STEPS;
+ 
+     // Extract ranges from first height layer (since HEIGHT_LAYERS = 1)
+     scan_msg.ranges.resize(LASER_STEPS);
+     scan_msg.intensities.resize(LASER_STEPS, 0.0f);
+ 
+     for (int i = 0; i < LASER_STEPS; ++i) {
+       scan_msg.ranges[i] = d_ranges[i];
+     }
+ 
+     // Apply median filter if enabled
+     if (enable_laser_scan_filter_ && laser_scan_filter_window_size_ > 1) {
+       applyMedianFilter(scan_msg.ranges, laser_scan_filter_window_size_);
+     }
+ 
+     laser_scan_pub_->publish(scan_msg);
+ 
+   }
+   }
+ 
+   // end mizdan
 }
 
 void OBCameraNode::publishColoredPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {
@@ -2837,18 +3101,36 @@ bool OBCameraNode::decodeColorFrameToBuffer(const std::shared_ptr<ob::Frame> &fr
 
 #if defined(USE_RK_HW_DECODER) || defined(USE_NV_HW_DECODER)
   if (frame && frame->getFormat() != OB_FORMAT_RGB888) {
-    if (frame->getFormat() == OB_FORMAT_MJPG && jpeg_decoder_) {
-      CHECK_NOTNULL(jpeg_decoder_.get());
-      CHECK_NOTNULL(rgb_buffer_);
-      auto video_frame = frame->as<ob::ColorFrame>();
-      bool ret = jpeg_decoder_->decode(video_frame, rgb_buffer_);
-      if (!ret) {
-        RCLCPP_ERROR_STREAM(logger_, "Decode frame failed");
-        is_decoded = false;
-
-      } else {
-        is_decoded = true;
-      }
+    if (frame->format() == OB_FORMAT_MJPG) {
+#if defined(USE_NV_HW_DECODER)
+            // For NVJPEG, check if we have hardware decoder available
+            if (jpeg_decoder_ && decoder_slot_acquired_) {
+              CHECK_NOTNULL(jpeg_decoder_.get());
+              CHECK_NOTNULL(rgb_buffer_);
+              auto video_frame = frame->as<ob::ColorFrame>();
+              bool ret = jpeg_decoder_->decode(video_frame, rgb_buffer_);
+              if (!ret) {
+                RCLCPP_ERROR_STREAM(logger_, "Hardware decode frame failed, falling back to software");
+                is_decoded = false;
+              } else {
+                is_decoded = true;
+              }
+            }
+            // If no hardware decoder available or hardware decode failed, fall through to software
+#elif defined(USE_RK_HW_DECODER)
+            if (jpeg_decoder_) {
+              CHECK_NOTNULL(jpeg_decoder_.get());
+              CHECK_NOTNULL(rgb_buffer_);
+              auto video_frame = frame->as<ob::ColorFrame>();
+              bool ret = jpeg_decoder_->decode(video_frame, rgb_buffer_);
+              if (!ret) {
+                RCLCPP_ERROR_STREAM(logger_, "Decode frame failed");
+                is_decoded = false;
+              } else {
+                is_decoded = true;
+              }
+            }
+#endif
     }
   }
 #endif

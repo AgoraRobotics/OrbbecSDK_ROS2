@@ -31,9 +31,13 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Vector3.h>
 #include <tf2/LinearMath/Transform.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
@@ -66,6 +70,7 @@
 #include "orbbec_camera/fps_counter.hpp"
 #include "jpeg_decoder.h"
 #include <std_msgs/msg/string.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -77,26 +82,26 @@
 
 #define STREAM_NAME(sip)                                                                       \
   (static_cast<std::ostringstream&&>(std::ostringstream()                                      \
-                                     << _stream_name[sip.first]                                \
+                                     << stream_name_[sip]                                \
                                      << ((sip.second > 0) ? std::to_string(sip.second) : ""))) \
       .str()
 #define FRAME_ID(sip)                                                                              \
   (static_cast<std::ostringstream&&>(std::ostringstream()                                          \
-                                     << getNamespaceStr() << "_" << STREAM_NAME(sip) << "_frame")) \
+                                     << camera_name_ << "_" << STREAM_NAME(sip) << "_frame")) \
       .str()
 #define OPTICAL_FRAME_ID(sip)                                                                     \
   (static_cast<std::ostringstream&&>(                                                             \
-       std::ostringstream() << getNamespaceStr() << "_" << STREAM_NAME(sip) << "_optical_frame")) \
+       std::ostringstream() << camera_name_ << "_" << STREAM_NAME(sip) << "_optical_frame")) \
       .str()
 #define ALIGNED_DEPTH_TO_FRAME_ID(sip)                                            \
   (static_cast<std::ostringstream&&>(std::ostringstream()                         \
-                                     << getNamespaceStr() << "_aligned_depth_to_" \
+                                     << camera_name_ << "_aligned_depth_to_" \
                                      << STREAM_NAME(sip) << "_frame"))            \
       .str()
 #define BASE_FRAME_ID() \
-  (static_cast<std::ostringstream&&>(std::ostringstream() << getNamespaceStr() << "_link")).str()
+  (static_cast<std::ostringstream&&>(std::ostringstream() << camera_name_ << "_link")).str()
 #define ODOM_FRAME_ID()                                                                           \
-  (static_cast<std::ostringstream&&>(std::ostringstream() << getNamespaceStr() << "_odom_frame")) \
+  (static_cast<std::ostringstream&&>(std::ostringstream() << camera_name_ << "_odom_frame")) \
       .str()
 
 #define DEVICE_PATH "/dev/camsync"
@@ -173,6 +178,31 @@ class OBCameraNode {
 
   void startIMU();
 
+  bool alocat = false;
+
+  float* d_x = nullptr;
+  float* d_y = nullptr; 
+  float* d_z = nullptr;
+  float* d_ranges = nullptr;
+  float* d_matrix = nullptr;
+  bool cuda_initialized = false;
+
+  static constexpr size_t MAX_POINTS = 1000000;  // Adjustable
+  int LASER_STEPS = 720; //360;
+
+  rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr laser_scan_pub_;
+  bool enable_laser_scan_ = false;
+  std::string laser_scan_frame_id_;
+  float laser_scan_min_range_ = 0.1f;
+  float laser_scan_max_range_ = 30.0f;
+  float laser_scan_min_height_ = 0.0f;
+  float laser_scan_max_height_ = 0.5f;
+  float laser_scan_angle_min_ = -1.5708f;  // -π/2
+  float laser_scan_angle_max_ = 1.5708f;   // +π/2
+  float laser_scan_angle_increment_ = 0.01f;
+  bool enable_laser_scan_filter_ = false;
+  int laser_scan_filter_window_size_ = 5;
+
   int openSocSyncPwmTrigger(uint16_t fps);
   int closeSocSyncPwmTrigger();
   void startGmslTrigger();
@@ -212,6 +242,10 @@ class OBCameraNode {
   void setupCameraCtrlServices();
 
   void stopStreams();
+
+  float getCameraHorizontalFOV();
+
+  void applyMedianFilter(std::vector<float>& ranges, int window_size);
 
   void stopIMU();
 
@@ -420,6 +454,10 @@ class OBCameraNode {
 
   void setDisparitySearchOffset();
 
+  // TF-based transformation helpers
+  void transformToMatrix(const geometry_msgs::msg::TransformStamped& transform, float* matrix);
+  void setIdentityMatrix(float* matrix);
+
  private:
   rclcpp::Node* node_ = nullptr;
   std::shared_ptr<ob::Device> device_ = nullptr;
@@ -580,6 +618,11 @@ class OBCameraNode {
   int depth_ae_roi_top_ = -1;
   int depth_ae_roi_right_ = -1;
   int depth_ae_roi_bottom_ = -1;
+
+  // TF2 for dynamic transform lookup
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  
   int mean_intensity_set_point_ = -1;
   int depth_brightness_ = -1;
   int ir_exposure_ = -1;
@@ -625,6 +668,10 @@ class OBCameraNode {
   std::shared_ptr<JPEGDecoder> jpeg_decoder_ = nullptr;
   uint8_t* rgb_buffer_ = nullptr;
   bool is_color_frame_decoded_ = false;
+#if defined(USE_NV_HW_DECODER)
+  bool decoder_slot_acquired_ = false;
+  std::string decoder_camera_id_;
+#endif
   std::recursive_mutex device_lock_;
   // For color
   std::queue<std::shared_ptr<ob::FrameSet>> color_frame_queue_;
