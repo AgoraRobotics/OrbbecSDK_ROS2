@@ -343,6 +343,9 @@ install/
 log/
 .obj-x86_64-linux-gnu/
 
+# Build directories
+build_tools/
+
 # Ignore generated docs
 
 # eclipse stuff
